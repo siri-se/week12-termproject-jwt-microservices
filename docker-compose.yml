@@ -1,0 +1,212 @@
+name: task-board-security
+
+services:
+
+  # ─────────── API Gateway ───────────
+  nginx:
+    build: ./nginx
+    container_name: taskboard-gateway
+    ports:
+      - "80:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      task-service:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    networks:
+      - taskboard-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service=nginx"
+
+  # ─────────── Auth Service ───────────
+  auth-service:
+    build: ./auth-service
+    container_name: taskboard-auth
+    environment:
+      PORT: 3001
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES: ${JWT_EXPIRES}
+      DB_HOST: auth-db
+      DB_NAME: ${AUTH_DB_NAME}
+      DB_USER: ${AUTH_DB_USER}
+      DB_PASSWORD: ${AUTH_DB_PASSWORD}
+    depends_on:
+      auth-db:
+        condition: service_healthy
+    networks:
+      - taskboard-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        tag: "auth-service"
+
+  auth-db:
+    image: postgres:15-alpine
+    container_name: taskboard-auth-db
+    environment:
+      POSTGRES_DB: ${AUTH_DB_NAME}
+      POSTGRES_USER: ${AUTH_DB_USER}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD}
+    volumes:
+      - auth-db-data:/var/lib/postgresql/data
+    networks:
+      - taskboard-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTH_DB_USER} -d ${AUTH_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─────────── Task Service ───────────
+  task-service:
+    build: ./task-service
+    container_name: taskboard-task
+    environment:
+      PORT: 3002
+      JWT_SECRET: ${JWT_SECRET}
+      DB_HOST: task-db
+      DB_NAME: ${TASK_DB_NAME}
+      DB_USER: ${TASK_DB_USER}
+      DB_PASSWORD: ${TASK_DB_PASSWORD}
+    depends_on:
+      task-db:
+        condition: service_healthy
+    networks:
+      - taskboard-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        tag: "task-service"
+
+  task-db:
+    image: postgres:15-alpine
+    container_name: taskboard-task-db
+    environment:
+      POSTGRES_DB: ${TASK_DB_NAME}
+      POSTGRES_USER: ${TASK_DB_USER}
+      POSTGRES_PASSWORD: ${TASK_DB_PASSWORD}
+    volumes:
+      - task-db-data:/var/lib/postgresql/data
+    networks:
+      - taskboard-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TASK_DB_USER} -d ${TASK_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─────────── User Service ───────────
+  user-service:
+    build: ./user-service
+    container_name: taskboard-user
+    environment:
+      PORT: 3003
+      JWT_SECRET: ${JWT_SECRET}
+      DB_HOST: user-db
+      DB_NAME: ${USER_DB_NAME}
+      DB_USER: ${USER_DB_USER}
+      DB_PASSWORD: ${USER_DB_PASSWORD}
+    depends_on:
+      user-db:
+        condition: service_healthy
+    networks:
+      - taskboard-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        tag: "user-service"
+
+  user-db:
+    image: postgres:15-alpine
+    container_name: taskboard-user-db
+    environment:
+      POSTGRES_DB: ${USER_DB_NAME}
+      POSTGRES_USER: ${USER_DB_USER}
+      POSTGRES_PASSWORD: ${USER_DB_PASSWORD}
+    volumes:
+      - user-db-data:/var/lib/postgresql/data
+    networks:
+      - taskboard-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${USER_DB_USER} -d ${USER_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─────────── Monitoring: Loki ───────────
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: taskboard-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/tmp/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - taskboard-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────── Monitoring: Promtail ─────────────────────────────────────────
+  # ⚠️ สำคัญ: Loki ไม่รับ Docker logs โดยตรง — ต้องมี Promtail ดึงให้
+  # Promtail อ่าน container log files แล้วส่งไป Loki
+  promtail:
+    image: grafana/promtail:2.9.0
+    container_name: taskboard-promtail
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./monitoring/promtail-config.yaml:/etc/promtail/config.yaml:ro
+    command: -config.file=/etc/promtail/config.yaml
+    networks:
+      - taskboard-net
+    depends_on:
+      loki:
+        condition: service_healthy
+
+  # ─────────── Monitoring: Grafana ───────────
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: taskboard-grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - taskboard-net
+    depends_on:
+      loki:
+        condition: service_healthy
+
+networks:
+  taskboard-net:
+    driver: bridge
+
+volumes:
+  auth-db-data:
+  task-db-data:
+  user-db-data:
+  grafana-data:
+  loki-data:
